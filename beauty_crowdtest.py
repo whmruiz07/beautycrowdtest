@@ -2,7 +2,7 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import random, math
+import random, math, hashlib
 from typing import Dict, List
 
 st.set_page_config(page_title="CrowdTest – Beauty Blogger", layout="wide")
@@ -20,7 +20,7 @@ with st.sidebar:
 
     st.header("🧪 測試設定")
     n_users = st.slider("模擬受眾人數", 200, 5000, 1200, step=100)
-    seed = st.number_input("隨機種子（重現結果）", value=42, step=1)
+    seed = st.number_input("基礎隨機種子（重現結果）", value=42, step=1)
 
     st.header("⚙️ 權重（可調）")
     w_len = st.slider("文案長度最佳區間權重", 0.0, 2.0, 0.6, 0.1)
@@ -36,6 +36,17 @@ with c1:
     txt_a = st.text_area("版本 A 文案", height=180, placeholder="例：開架粉底完勝？新款柔霧持妝，一整天不暗沉！我的上妝步驟＋持妝小技巧👇")
 with c2:
     txt_b = st.text_area("版本 B 文案", height=180, placeholder="例：敏感肌也能用的保濕精華，7天有感透亮。成分＋用法＋注意事項都寫給你！")
+
+# Controls to vary "audience thoughts"
+st.markdown("### 🎲 受眾想法隨機性")
+colx, coly, colz = st.columns([1,1,2])
+with colx:
+    auto_random = st.checkbox("每次重跑都不同", value=False, help="開啟後，每次執行會加入隨機抖動。")
+with coly:
+    if "shuffle_k" not in st.session_state:
+        st.session_state.shuffle_k = 0
+    if st.button("🔁 重新洗牌想法"):
+        st.session_state.shuffle_k += 1
 
 run = st.button("🚀 開始 CrowdTest")
 
@@ -87,8 +98,19 @@ POS_BANK = ["看起來很真實、不是硬廣。","步驟清楚，懶人也能�
 NEG_BANK = ["資訊有點散，看不出重點。","像在賣東西，缺少個人使用感。","步驟太快/太長，跟不上。","沒有講到可能的副作用或注意事項。","照片修得太過頭，不真實。","Hashtag 太多/太少，像是機器發文。"]
 HINTS_BY_TERM = {"敏感":"提一下致敏風險與避雷成分。","痘":"增加實際痘痘期間的使用心得。","保濕":"補上吸收時間與後續疊擦感受。","抗老":"說明見效時間與耐受度安排。","防曬":"補充室內/戶外/補擦建議。","開架":"可以給替代清單或比價。","提亮":"用自然光拍未開濾鏡照片。"}
 
-def gen_thoughts(txt, feats, rng):
-    bank = []; bank += rng.sample(POS_BANK, k=3); bank += rng.sample(NEG_BANK, k=2)
+def stable_seed(*parts) -> int:
+    m = hashlib.md5()
+    for p in parts:
+        m.update(str(p).encode("utf-8"))
+    return int(m.hexdigest()[:8], 16)  # 32-bit int
+
+def gen_thoughts(txt, feats, base_seed: int, persona: dict, shuffle_k: int, auto_random: bool) -> List[str]:
+    jitter = random.randint(0, 10_000) if auto_random else 0
+    s = stable_seed(txt, persona, base_seed, shuffle_k, jitter)
+    rng = random.Random(s)
+    bank = []
+    bank += rng.sample(POS_BANK, k=3)
+    bank += rng.sample(NEG_BANK, k=2)
     for k, note in HINTS_BY_TERM.items():
         if k in txt: bank.append(note)
     if feats["n_emoji"] >= 3: bank.append("整體氛圍可愛有活力，蠻像姐妹聊天。")
@@ -103,25 +125,28 @@ def gen_thoughts(txt, feats, rng):
 # ---- Heat color without matplotlib ----
 def heat_css(v: float) -> str:
     if pd.isna(v): return ""
-    if v >= 0.85: return "background-color:#1e7e34;color:white;"   # strong green
-    if v >= 0.7:  return "background-color:#4CAF50;color:white;"   # green
-    if v >= 0.55: return "background-color:#C8E6C9;color:#222;"    # light green
-    if v >= 0.4:  return "background-color:#FFF59D;color:#222;"    # yellow
-    if v >= 0.25: return "background-color:#FFCCBC;color:#222;"    # light orange
-    return "background-color:#F44336;color:white;"                 # red
+    if v >= 0.85: return "background-color:#1e7e34;color:white;"
+    if v >= 0.7:  return "background-color:#4CAF50;color:white;"
+    if v >= 0.55: return "background-color:#C8E6C9;color:#222;"
+    if v >= 0.4:  return "background-color:#FFF59D;color:#222;"
+    if v >= 0.25: return "background-color:#FFCCBC;color:#222;"
+    return "background-color:#F44336;color:white;"
 
 # ---------- Run ----------
 if run:
-    rng = random.Random(int(seed))
+    # persona dict for seeding thoughts
+    persona = {"age":age, "focus":sorted(focus), "budget":budget, "platform":platform, "region":region}
+    rng_metrics = random.Random(int(seed))  # metrics沿用seed，確保可重現
     weights = {"len":w_len,"emoji":w_emoji,"hash":w_hashtag,"value":w_value,"skin":w_skin,"auth":w_auth}
 
-    feats_a = text_features(txt_a, platform)
-    feats_b = text_features(txt_b, platform)
+    # 文案特徵與互動機率
+    def text_features_local(t): return text_features(t, platform)
+    feats_a, feats_b = text_features_local(txt_a), text_features_local(txt_b)
     probs_a = engagement_prob(feats_a, weights)
     probs_b = engagement_prob(feats_b, weights)
 
-    la, ca, sa, sva = simulate_engagement(n_users, probs_a, rng)
-    lb, cb, sb, svb = simulate_engagement(n_users, probs_b, rng)
+    la, ca, sa, sva = simulate_engagement(n_users, probs_a, rng_metrics)
+    lb, cb, sb, svb = simulate_engagement(n_users, probs_b, rng_metrics)
 
     pa = {k: v/n_users for k,v in zip(["like","comment","share","save"], [la,ca,sa,sva])}
     pb = {k: v/n_users for k,v in zip(["like","comment","share","save"], [lb,cb,sb,svb])}
@@ -153,12 +178,13 @@ if run:
         "A": [feats_a["len_score"], feats_a["emoji_score"], feats_a["hash_score"], feats_a["value_score"], feats_a["skin_score"], feats_a["auth_score"]],
         "B": [feats_b["len_score"], feats_b["emoji_score"], feats_b["hash_score"], feats_b["value_score"], feats_b["skin_score"], feats_b["auth_score"]],
     }).set_index("項目")
-    diag_styled = diag.style.applymap(heat_css)  # no matplotlib needed
+    diag_styled = diag.style.applymap(lambda v: heat_css(float(v)))
     st.dataframe(diag_styled, use_container_width=True)
 
     st.markdown("### 💭 受眾的想法（質性摘要）")
-    thoughts_a = gen_thoughts(txt_a, feats_a, rng)
-    thoughts_b = gen_thoughts(txt_b, feats_b, rng)
+    thoughts_a = gen_thoughts(txt_a, feats_a, int(seed), persona, st.session_state.get("shuffle_k",0), auto_random)
+    thoughts_b = gen_thoughts(txt_b, feats_b, int(seed)+7, persona, st.session_state.get("shuffle_k",0), auto_random)
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**版本 A – 受眾想法**")
